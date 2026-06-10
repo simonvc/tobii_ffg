@@ -21,6 +21,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -171,21 +172,7 @@ static int cursorpos_get(long *x,long *y){
     *x=atol(xv); *y=atol(yv); return 1;
 }
 static int cmp_int(const void*a,const void*b){ int x=*(const int*)a,y=*(const int*)b; return (x>y)-(x<y); }
-// Drain stale buffered packets, then take the median raw X/Y over up to n valid frames.
-static int sample_gaze_median(libusb_device_handle *h,int n,double *mx,double *my){
-    unsigned char buf[8192]; int tr;
-    while(libusb_bulk_transfer(h,EP_IN,buf,sizeof buf,&tr,5)==0 && tr>0){}   // flush
-    int *xs=malloc(sizeof(int)*n),*ys=malloc(sizeof(int)*n),c=0;
-    long deadline=now_ms()+3000;
-    while(c<n && now_ms()<deadline){
-        if(libusb_bulk_transfer(h,EP_IN,buf,sizeof buf,&tr,1000)<0||tr<PKT_LEN) continue;
-        if(!buf[OFF_VALID]) continue;
-        xs[c]=be16(buf,OFF_GAZE_X); ys[c]=be16(buf,OFF_GAZE_Y); c++;
-    }
-    int ok=c>=5;
-    if(ok){ qsort(xs,c,sizeof(int),cmp_int); qsort(ys,c,sizeof(int),cmp_int); *mx=xs[c/2]; *my=ys[c/2]; }
-    free(xs); free(ys); return ok?c:0;
-}
+static double median_int(int *v,int n){ qsort(v,n,sizeof(int),cmp_int); return v[n/2]; }
 // least squares: y = a*x + b
 static void fit_line(const double *X,const double *Y,int n,double *a,double *b){
     double sx=0,sy=0,sxx=0,sxy=0;
@@ -204,20 +191,37 @@ static int run_calibration(libusb_device_handle *h){
         "Type q + Enter when done. Need at least 2 points; 5+ recommended.\n\n");
     gaze_init(h);
     double RX[64],NX[64],RY[64],NY[64]; int np=0;
+    // Rolling buffer of the most recent valid gaze frames. We read the stream
+    // continuously (so the illuminators stay on) and, when you press Enter,
+    // use the median of the last ~RING frames — i.e. while you were on the cursor.
+    #define RING 24
+    int rx[RING], ry[RING], rn=0, rpos=0;
+    unsigned char buf[8192]; int tr;
     char line[64];
+    fprintf(stderr,"point %d: look at the cursor, press Enter (q=finish) ",np+1); fflush(stderr);
+    struct pollfd pfd = { .fd = 0, .events = POLLIN };
     while(np<64){
-        fprintf(stderr,"point %d: look at the cursor, press Enter (q=finish) ",np+1); fflush(stderr);
+        // keep the gaze stream flowing (lights on) + fill the rolling buffer
+        if(libusb_bulk_transfer(h,EP_IN,buf,sizeof buf,&tr,40)==0 && tr>=PKT_LEN && buf[OFF_VALID]){
+            rx[rpos]=be16(buf,OFF_GAZE_X); ry[rpos]=be16(buf,OFF_GAZE_Y);
+            rpos=(rpos+1)%RING; if(rn<RING) rn++;
+        }
+        if(poll(&pfd,1,0)<=0 || !(pfd.revents&POLLIN)) continue;   // Enter pressed?
         if(!fgets(line,sizeof line,stdin)) break;
         if(line[0]=='q'||line[0]=='Q') break;
         long cx,cy;
-        if(!cursorpos_get(&cx,&cy)){ fprintf(stderr,"  ! couldn't read cursor position\n"); continue; }
-        double tnx=(double)(cx-mx)/mw, tny=(double)(cy-my)/mh;
+        if(!cursorpos_get(&cx,&cy)){ fprintf(stderr,"  ! couldn't read cursor position\n"); goto next; }
+        double tnx=(double)(cx-mx)/(double)mw, tny=(double)(cy-my)/(double)mh;
         if(tnx<-0.05||tnx>1.05||tny<-0.05||tny>1.05){
-            fprintf(stderr,"  ! cursor not on %s (target %.2f,%.2f) — skipped\n",C.monitor,tnx,tny); continue; }
-        double gmx,gmy;
-        if(!sample_gaze_median(h,25,&gmx,&gmy)){ fprintf(stderr,"  ! no valid gaze (look at the cursor) — skipped\n"); continue; }
+            fprintf(stderr,"  ! cursor not on %s (target %.2f,%.2f) — skipped\n",C.monitor,tnx,tny); goto next; }
+        if(rn<5){ fprintf(stderr,"  ! no valid gaze (look at the cursor) — skipped\n"); goto next; }
+        int tx[RING],ty[RING]; for(int i=0;i<rn;i++){ tx[i]=rx[i]; ty[i]=ry[i]; }
+        double gmx=median_int(tx,rn), gmy=median_int(ty,rn);
         RX[np]=gmx; NX[np]=tnx; RY[np]=gmy; NY[np]=tny; np++;
         fprintf(stderr,"  ok: screen (%.2f,%.2f)  raw gaze (%.0f,%.0f)  [%d captured]\n",tnx,tny,gmx,gmy,np);
+    next:
+        rn=0; rpos=0;   // reset buffer for the next point
+        if(np<64){ fprintf(stderr,"point %d: look at the cursor, press Enter (q=finish) ",np+1); fflush(stderr); }
     }
     if(np<2){ fprintf(stderr,"\nneed >= 2 points; config unchanged.\n"); return 1; }
     double ax,bx,ay,by;
