@@ -51,27 +51,27 @@ static void cfg_path(char *out, size_t n){
     if (xc && *xc) snprintf(out, n, "%s/tobii_ffg/config", xc);
     else snprintf(out, n, "%s/.config/tobii_ffg/config", home ? home : ".");
 }
+static int cfg_save(void){
+    char path[512]; cfg_path(path, sizeof path);
+    char dir[512]; snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/'); if (slash){ *slash=0; mkdir(dir, 0755); }
+    FILE *f = fopen(path, "w");
+    if (!f){ fprintf(stderr, "[!] cannot write %s\n", path); return 0; }
+    fprintf(f,
+        "# tobii_ffg config\n"
+        "monitor=%s\n"
+        "dwell_ms=%ld\n"
+        "# gaze affine: normalized = raw*scale + offset (per display/user)\n"
+        "x_scale=%.9g\nx_offset=%.9g\ny_scale=%.9g\ny_offset=%.9g\n",
+        C.monitor, C.dwell_ms, C.xs, C.xo, C.ys, C.yo);
+    fclose(f);
+    fprintf(stderr, "[*] saved config to %s\n", path);
+    return 1;
+}
 static void cfg_load_or_create(void){
     char path[512]; cfg_path(path, sizeof path);
     FILE *f = fopen(path, "r");
-    if (!f){
-        // create dir + default config
-        char dir[512]; snprintf(dir, sizeof dir, "%s", path);
-        char *slash = strrchr(dir, '/'); if (slash){ *slash=0; mkdir(dir, 0755); }
-        f = fopen(path, "w");
-        if (f){
-            fprintf(f,
-                "# tobii_ffg config\n"
-                "monitor=%s\n"
-                "dwell_ms=%ld\n"
-                "# gaze affine: normalized = raw*scale + offset (per display/user)\n"
-                "x_scale=%.9g\nx_offset=%.9g\ny_scale=%.9g\ny_offset=%.9g\n",
-                C.monitor, C.dwell_ms, C.xs, C.xo, C.ys, C.yo);
-            fclose(f);
-            fprintf(stderr, "[*] wrote default config to %s\n", path);
-        }
-        return;
-    }
+    if (!f){ cfg_save(); return; }
     char line[256];
     while (fgets(line, sizeof line, f)){
         if (line[0]=='#' || line[0]=='\n') continue;
@@ -152,25 +152,112 @@ static long now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); 
 static int16_t be16(const unsigned char*p,int o){ return (int16_t)((p[o]<<8)|p[o+1]); }
 static volatile int running=1; static void on_sigint(int s){(void)s; running=0;}
 
+// vendor enable + replay init/config sequence so the device streams valid gaze.
+static void gaze_init(libusb_device_handle *h){
+    unsigned char buf[8192]; int tr;
+    libusb_control_transfer(h,0x41,0x41,0,0,NULL,0,1000);   // vendor enable
+    fprintf(stderr,"[*] sending %d init commands...\n",init_cmds_count);
+    for(int i=0;i<init_cmds_count;i++){
+        libusb_bulk_transfer(h,EP_OUT,(unsigned char*)init_cmds[i].data,(int)init_cmds[i].len,&tr,1000);
+        for(int k=0;k<4;k++){ if(libusb_bulk_transfer(h,EP_IN,buf,sizeof buf,&tr,30)!=0||tr==0) break; }
+    }
+}
+
+// ---- calibration ----
+static int cursorpos_get(long *x,long *y){
+    char buf[256]; if(hypr_req("j/cursorpos",buf,sizeof buf)<=0) return 0;
+    const char *xv=field(buf,"x"),*yv=field(buf,"y");
+    if(!xv||!yv) return 0;
+    *x=atol(xv); *y=atol(yv); return 1;
+}
+static int cmp_int(const void*a,const void*b){ int x=*(const int*)a,y=*(const int*)b; return (x>y)-(x<y); }
+// Drain stale buffered packets, then take the median raw X/Y over up to n valid frames.
+static int sample_gaze_median(libusb_device_handle *h,int n,double *mx,double *my){
+    unsigned char buf[8192]; int tr;
+    while(libusb_bulk_transfer(h,EP_IN,buf,sizeof buf,&tr,5)==0 && tr>0){}   // flush
+    int *xs=malloc(sizeof(int)*n),*ys=malloc(sizeof(int)*n),c=0;
+    long deadline=now_ms()+3000;
+    while(c<n && now_ms()<deadline){
+        if(libusb_bulk_transfer(h,EP_IN,buf,sizeof buf,&tr,1000)<0||tr<PKT_LEN) continue;
+        if(!buf[OFF_VALID]) continue;
+        xs[c]=be16(buf,OFF_GAZE_X); ys[c]=be16(buf,OFF_GAZE_Y); c++;
+    }
+    int ok=c>=5;
+    if(ok){ qsort(xs,c,sizeof(int),cmp_int); qsort(ys,c,sizeof(int),cmp_int); *mx=xs[c/2]; *my=ys[c/2]; }
+    free(xs); free(ys); return ok?c:0;
+}
+// least squares: y = a*x + b
+static void fit_line(const double *X,const double *Y,int n,double *a,double *b){
+    double sx=0,sy=0,sxx=0,sxy=0;
+    for(int i=0;i<n;i++){ sx+=X[i]; sy+=Y[i]; sxx+=X[i]*X[i]; sxy+=X[i]*Y[i]; }
+    double d=n*sxx-sx*sx;
+    if(d==0){ *a=0; *b=sy/n; return; }
+    *a=(n*sxy-sx*sy)/d; *b=(sy-*a*sx)/n;
+}
+static int run_calibration(libusb_device_handle *h){
+    long mx,my,mw,mh,ws;
+    if(!monitors_get(C.monitor,&mx,&my,&mw,&mh,&ws)){ fprintf(stderr,"monitor '%s' not found\n",C.monitor); return 1; }
+    fprintf(stderr,"\n=== tobii_ffg calibration — monitor %s (%ldx%ld) ===\n",C.monitor,mw,mh);
+    fprintf(stderr,
+        "For each point: move the MOUSE somewhere on this monitor, LOOK AT THE CURSOR,\n"
+        "then press Enter. Spread points out (4 corners + centre is ideal).\n"
+        "Type q + Enter when done. Need at least 2 points; 5+ recommended.\n\n");
+    gaze_init(h);
+    double RX[64],NX[64],RY[64],NY[64]; int np=0;
+    char line[64];
+    while(np<64){
+        fprintf(stderr,"point %d: look at the cursor, press Enter (q=finish) ",np+1); fflush(stderr);
+        if(!fgets(line,sizeof line,stdin)) break;
+        if(line[0]=='q'||line[0]=='Q') break;
+        long cx,cy;
+        if(!cursorpos_get(&cx,&cy)){ fprintf(stderr,"  ! couldn't read cursor position\n"); continue; }
+        double tnx=(double)(cx-mx)/mw, tny=(double)(cy-my)/mh;
+        if(tnx<-0.05||tnx>1.05||tny<-0.05||tny>1.05){
+            fprintf(stderr,"  ! cursor not on %s (target %.2f,%.2f) — skipped\n",C.monitor,tnx,tny); continue; }
+        double gmx,gmy;
+        if(!sample_gaze_median(h,25,&gmx,&gmy)){ fprintf(stderr,"  ! no valid gaze (look at the cursor) — skipped\n"); continue; }
+        RX[np]=gmx; NX[np]=tnx; RY[np]=gmy; NY[np]=tny; np++;
+        fprintf(stderr,"  ok: screen (%.2f,%.2f)  raw gaze (%.0f,%.0f)  [%d captured]\n",tnx,tny,gmx,gmy,np);
+    }
+    if(np<2){ fprintf(stderr,"\nneed >= 2 points; config unchanged.\n"); return 1; }
+    double ax,bx,ay,by;
+    fit_line(RX,NX,np,&ax,&bx); fit_line(RY,NY,np,&ay,&by);
+    C.xs=ax; C.xo=bx; C.ys=ay; C.yo=by;
+    fprintf(stderr,"\nnew calibration (%d points):\n  x = %.8g*raw + %.5g\n  y = %.8g*raw + %.5g\n",np,ax,bx,ay,by);
+    cfg_save();
+    return 0;
+}
+
 int main(int argc,char**argv){
-    int do_print=0, debug=0;
+    int do_print=0, debug=0, calibrate=0;
     const char *ov_mon=NULL; long ov_dwell=-1;
     cfg_load_or_create();
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--monitor")&&i+1<argc) ov_mon=argv[++i];
         else if(!strcmp(argv[i],"--dwell-ms")&&i+1<argc) ov_dwell=atol(argv[++i]);
         else if(!strcmp(argv[i],"--print")) do_print=1;
+        else if(!strcmp(argv[i],"--calibrate")) calibrate=1;
         else if(!strcmp(argv[i],"--debug")) debug=1;
+        else if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){
+            printf("usage: tobii_ffg [--calibrate] [--print] [--monitor NAME] [--dwell-ms N] [--debug]\n"
+                   "  (no flags)   focus follows gaze in Hyprland\n"
+                   "  --calibrate  interactively recalibrate gaze->screen and save to config\n"
+                   "  --print      print normalized gaze 'x y' instead of focusing\n"
+                   "  --monitor N  monitor the tracker sits under (default from config)\n"
+                   "  --dwell-ms N gaze dwell before focusing (default from config)\n");
+            return 0;
+        }
     }
     if(ov_mon) strncpy(C.monitor,ov_mon,sizeof C.monitor-1);
     if(ov_dwell>=0) C.dwell_ms=ov_dwell;
 
     const char *xrd=getenv("XDG_RUNTIME_DIR"),*his=getenv("HYPRLAND_INSTANCE_SIGNATURE");
-    if(!do_print && (!xrd||!his)){ fprintf(stderr,"need XDG_RUNTIME_DIR + HYPRLAND_INSTANCE_SIGNATURE (or use --print)\n"); return 1; }
+    int need_hypr = !do_print;   // focusing and calibration both need the Hyprland socket
+    if(need_hypr && (!xrd||!his)){ fprintf(stderr,"need XDG_RUNTIME_DIR + HYPRLAND_INSTANCE_SIGNATURE (or use --print)\n"); return 1; }
     if(xrd&&his) snprintf(sockpath,sizeof sockpath,"%s/hypr/%s/.socket.sock",xrd,his);
 
     long mx=0,my=0,mw=3440,mh=1440,mon_ws=-1;
-    if(!do_print){
+    if(need_hypr && !calibrate){
         if(!monitors_get(C.monitor,&mx,&my,&mw,&mh,&mon_ws)){ fprintf(stderr,"monitor '%s' not found\n",C.monitor); return 1; }
         fprintf(stderr,"[*] monitor %s (%ld,%ld) %ldx%ld; dwell %ldms\n",C.monitor,mx,my,mw,mh,C.dwell_ms);
     }
@@ -184,13 +271,14 @@ int main(int argc,char**argv){
     int r=libusb_claim_interface(h,IFACE);
     if(r<0){ fprintf(stderr,"claim_interface: %s\n",libusb_error_name(r)); return 1; }
 
-    unsigned char buf[8192]; int tr;
-    libusb_control_transfer(h,0x41,0x41,0,0,NULL,0,1000);   // vendor enable
-    fprintf(stderr,"[*] sending %d init commands...\n",init_cmds_count);
-    for(int i=0;i<init_cmds_count;i++){
-        libusb_bulk_transfer(h,EP_OUT,(unsigned char*)init_cmds[i].data,(int)init_cmds[i].len,&tr,1000);
-        for(int k=0;k<4;k++){ if(libusb_bulk_transfer(h,EP_IN,buf,sizeof buf,&tr,30)!=0||tr==0) break; }
+    if(calibrate){
+        int rc=run_calibration(h);
+        libusb_release_interface(h,IFACE); libusb_close(h); libusb_exit(ctx);
+        return rc;
     }
+
+    unsigned char buf[8192]; int tr;
+    gaze_init(h);
     fprintf(stderr,"[*] %s (Ctrl-C to stop)\n", do_print?"printing gaze":"focus follows gaze");
 
     struct win wins[MAXW]; int nwin=0; long last_refresh=0;

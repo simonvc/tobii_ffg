@@ -56,7 +56,31 @@ y_offset=0.0058576
   (run `tobii_ffg --print` and watch the values at known screen points).
 
 Command-line flags override the config for that run:
-`--monitor NAME`, `--dwell-ms N`, `--print`, `--debug`.
+`--monitor NAME`, `--dwell-ms N`, `--print`, `--debug`. `--help` lists them.
+
+### Recalibration
+
+Gaze→screen accuracy drifts with seating position, head distance, glasses, or a
+different display. To recalibrate:
+
+```sh
+tobii_ffg --calibrate
+```
+
+It uses your **mouse cursor as the target** (no on-screen GUI needed):
+
+1. Move the mouse to a spot on the tracker's monitor.
+2. **Look at the cursor** and press **Enter** — it reads the exact cursor position
+   from Hyprland as ground truth and samples your gaze there.
+3. Repeat at several spread-out spots — the **four corners + centre** is ideal
+   (5+ points). Points off the configured monitor, or where it sees no valid gaze,
+   are skipped with a message.
+4. Type **q** then Enter to finish.
+
+It then least-squares fits the `x`/`y` affine and writes it back to
+`~/.config/tobii_ffg/config` (need ≥2 points; if you abort earlier the config is
+left unchanged). Tip: run `tobii_ffg --print` afterwards and glance at the four
+corners — the values should read roughly `0,0` … `1,1`.
 
 ## Use — the standalone pair (alternative)
 
