@@ -1,0 +1,23 @@
+# compiled binaries
+tobii_ffg
+tobii_gaze
+tobii_focus
+test/diag
+test/gaze_test
+test/verbose
+
+# vendored Tobii blobs (large, not redistributable)
+vendor/
+
+# large raw capture (keep the small decoded .txt/.log references)
+captures/*.pcapng
+
+# python cruft
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+.python-version
